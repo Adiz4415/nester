@@ -90,8 +90,17 @@ func TestVaultServiceFullYieldCycleIntegration(t *testing.T) {
 	totalYield := decimal.RequireFromString(seededTotalYield)
 	dailyYield := totalYield.Div(decimal.NewFromInt(30)).Round(8)
 
-	now := time.Now().UTC().Truncate(time.Microsecond)
-	startAt := now.Add(-30 * dailyInterval)
+	// Inject a single fixed clock value into performancesvc.Service so the
+	// APYHistoryForVault rolling 30-day window (`since = clock() - 30*24h`)
+	// aligns exactly with the snapshot timestamps we insert below. Without
+	// this, sub-second drift between time.Now() calls produces 30 stored rows
+	// but only 29 daily buckets (date_trunc('day', snapshot_at) collapses a
+	// trailing edge case into the prior bucket). With SetClock in place the
+	// test is deterministic across held CI runners, suspended VMs, and
+	// future additions of work between insert and the APY query.
+	testClock := time.Now().UTC().Truncate(time.Microsecond)
+	perfSvc.SetClock(func() time.Time { return testClock })
+	startAt := testClock.Add(-30 * dailyInterval)
 
 	for day := 0; day < 30; day++ {
 		balance := deposited.Add(dailyYield.Mul(decimal.NewFromInt(int64(day) + 1)))
@@ -114,6 +123,19 @@ func TestVaultServiceFullYieldCycleIntegration(t *testing.T) {
 		}
 	}
 
+	// Pre-assertion: 30 snapshot rows persisted. See the SetClock block above
+	// for why this count is non-trivial under clock drift.
+	var snapshotCount int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM vault_performance_snapshots WHERE vault_id = $1`,
+		vault.ID,
+	).Scan(&snapshotCount); err != nil {
+		t.Fatalf("count snapshots: %v", err)
+	}
+	if snapshotCount != 30 {
+		t.Fatalf("stored snapshots: got %d, want 30", snapshotCount)
+	}
+
 	// Promote the accrued yield to the vault row so HarvestVault picks it up.
 	if _, err := db.ExecContext(ctx,
 		`UPDATE vaults
@@ -129,10 +151,15 @@ func TestVaultServiceFullYieldCycleIntegration(t *testing.T) {
 
 	// ── 4. Harvest (no-op on-chain invoker) ─────────────────────────────────
 	compound := false
+	// WalletAddress is required by VaultService.HarvestVault whenever a
+	// DepositInvoker (including Noop) is wired — the value is passed to the
+	// invoker. The Noop invoker ignores it but VaultService still enforces its
+	// presence as part of its safety check.
 	result, err := vaultSvc.HarvestVault(ctx, HarvestVaultInput{
-		VaultID:  vault.ID,
-		UserID:   userID,
-		Compound: &compound,
+		VaultID:       vault.ID,
+		UserID:        userID,
+		WalletAddress: "GWALLET-NOOP-TEST-001",
+		Compound:      &compound,
 	})
 	if err != nil {
 		t.Fatalf("HarvestVault() error = %v", err)
@@ -242,6 +269,17 @@ func openYieldCycleDB(t *testing.T) *sql.DB {
 
 func applyYieldCycleMigrations(t *testing.T, db *sql.DB) {
 	t.Helper()
+	// Migration ordering notes (also required for production):
+	//  - 008 creates vault_transactions with the `tx_hash` column.
+	//  - 033 renames `tx_hash` → `transaction_hash` and adds the fee columns.
+	//  - 023 builds a UNIQUE INDEX on `transaction_hash`, so it MUST run after
+	//    033. Numeric ordering (008→023→033) fails on a fresh DB because 023
+	//    would reference a column that does not exist yet. We pin 033 before
+	//    023 here to keep the integration test self-contained on a fresh DB.
+	//  - 035 is intentionally skipped (byte-identical duplicate of 033 which
+	//    would re-run the non-idempotent RENAME COLUMN and fail).
+	//  - 036 widens vault_transactions.type CHECK to allow 'harvest' rows
+	//    produced by RecordHarvest.
 	for _, name := range []string{
 		"001_create_users_table.up.sql",
 		"002_create_vaults_table.up.sql",
@@ -252,14 +290,14 @@ func applyYieldCycleMigrations(t *testing.T, db *sql.DB) {
 		"014_add_missing_columns.up.sql",
 		"016_add_indices_and_constraints.up.sql",
 		"018_create_vault_performance.up.sql",
-		"023_vault_transactions_hash_unique.up.sql",
-		// 033 vault_transactions update (acts on tx_hash→transaction_hash + adds fee columns).
+		// 033 BEFORE 023 — see ordering note above.
 		"033_update_vault_transactions.up.sql",
-		// 035 is intentionally skipped — byte-identical duplicate of 033.
-		// 036 widens the type CHECK to allow 'harvest' rows produced by RecordHarvest.
+		"023_vault_transactions_hash_unique.up.sql",
 		"036_allow_harvest_transaction_type.up.sql",
 	} {
-		path := filepath.Join("..", "..", "..", "migrations", name)
+		// Test file lives at apps/api/internal/service/ → migrations are two
+		// directories up at apps/api/migrations.
+		path := filepath.Join("..", "..", "migrations", name)
 		contents, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("ReadFile(%q) error = %v", path, err)
